@@ -13,16 +13,38 @@ right away.
 Workflow:
   1. Choose the main project source file
   2. Pick PyInstaller switches via checkboxes; optionally set --distpath
-  3. Maintain the exclude-module list (pre-populated with known trouble
-     makers, enabled by default), laid out as a scrollable multi-column
-     grid so large lists stay manageable
-  4. Maintain the add-binary list (pre-populated with known DLL cases,
-     DISABLED by default - the user enables exactly what the current
-     project needs, since e.g. NumPy DLL hash filenames differ from
-     machine to machine), same scrollable grid layout
+  3. Maintain the exclude-module list (global catalog, shown unchecked
+     by default; checking an entry only affects the current project)
+  4. Maintain the add-binary list (same global-catalog behavior, keyed
+     by DLL filename so the same DLL can be re-pathed per machine by
+     double-clicking its entry)
   5. "Build Project" validates that all enabled add-binary source paths
      exist, clears the log view, then automatically switches to the Live
      Log tab and starts the build
+
+  Global catalog vs. per-project selection: exclude-module names and
+  add-binary entries that have ever been used across ANY project are
+  accumulated in a global catalog file
+  (pyinstaller_builder.catalog.json, next to this program), independent
+  of whether they are currently checked. Loading a project only decides
+  which of these globally known entries are CHECKED for that particular
+  project. Add-binary entries are keyed by DLL filename (not full path),
+  since the same DLL often lives at different absolute paths on
+  different machines; double-clicking an entry lets you edit its stored
+  path/target in place. The catalog is written whenever a build starts,
+  and once more on program exit if a project was loaded.
+
+  A note on locating the catalog file when frozen with PyInstaller: the
+  catalog must live next to the actual .exe the user runs, not next to
+  a temporary, per-run extraction folder. Using __file__ for this would
+  break once this tool itself is packaged into a onefile EXE, because
+  __file__ then points into a fresh temporary _MEIxxxxxx folder that is
+  recreated (and later deleted) on every single launch - the catalog
+  would silently reset itself every time the program starts. The
+  correct, PyInstaller-recommended approach is to branch on sys.frozen
+  and use os.path.dirname(sys.executable) instead, which always points
+  to wherever the actual .exe file has been placed and therefore stays
+  stable across restarts.
 
   A note on --distpath/--workpath: PyInstaller resolves these paths
   relative to the CURRENT WORKING DIRECTORY of the calling process, not
@@ -73,6 +95,10 @@ Workflow:
 
 Project configuration is stored next to the source file:
     <scriptname>.pyinstaller.json
+Global catalog (accumulated excludes/add-binaries across all projects)
+is stored next to this program (the .py file, or the .exe if this tool
+itself has been packaged with PyInstaller):
+    pyinstaller_builder.catalog.json
 
 Tested for: Windows, Python 3.x, PyInstaller (current versions)
 """
@@ -118,8 +144,6 @@ DEFAULT_EXCLUDES = [
     "easyocr",
 ]
 
-# Further common candidates - NOT enabled by default, offered as
-# ready-made entries in case they show up in a given project.
 SUGGESTED_EXTRA_EXCLUDES = [
     "notebook",
     "jupyter",
@@ -132,10 +156,6 @@ SUGGESTED_EXTRA_EXCLUDES = [
     "llvmlite",
 ]
 
-# Pre-populated add-binary candidates. Disabled by default because e.g.
-# NumPy DLL filenames contain a build hash that can differ between
-# machines - the user enables exactly what fits and adjusts the path if
-# needed.
 DEFAULT_ADD_BINARIES: list[AddBinaryEntry] = [
     {
         "src": r"C:/Python/Lib/site-packages/numpy.libs/libscipy_openblas64_-43e11ff0749b8cbe0a615c9cf6737e0e.dll",
@@ -169,8 +189,6 @@ DEFAULT_ADD_BINARIES: list[AddBinaryEntry] = [
     },
 ]
 
-# Common PyInstaller switches selectable via checkbox.
-# (name, label, enabled_by_default)
 PYINSTALLER_SWITCHES = [
     ("--onefile", "Onefile (single EXE)", True),
     ("--onedir", "Onedir (folder with EXE + dependencies)", False),
@@ -181,8 +199,31 @@ PYINSTALLER_SWITCHES = [
     ("--debug=all", "Debug build (bootloader diagnostics)", False),
 ]
 
-# Number of columns used for the exclude-module and add-binary grids.
 GRID_COLUMNS = 3
+
+CATALOG_FILENAME = "pyinstaller_builder.catalog.json"
+
+
+def get_app_dir() -> str:
+    """Returns the folder this program itself lives in - stable across
+    restarts whether run as a plain .py script or as a PyInstaller-frozen
+    .exe. Uses sys.executable when frozen instead of __file__, since
+    __file__ would otherwise point into a temporary, per-launch
+    extraction folder in onefile mode."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def dll_catalog_key(path: str) -> str:
+    """Identity used for add-binary catalog entries: the bare filename,
+    lower-cased. The same DLL frequently lives at different absolute
+    paths on different machines (e.g. NumPy build-hash filenames), so
+    keying by filename lets one catalog entry represent "this DLL",
+    editable in place, rather than accumulating duplicate near-identical
+    entries per machine."""
+    return os.path.basename(path.replace("\\", "/")).strip().lower()
+
 
 # ----------------------------------------------------------------------
 # Log parsing: which DEBUG lines matter to the user?
@@ -199,18 +240,11 @@ RE_ANALYZING_BINARY = re.compile(r"Analyzing binary\s+'(.+)'", re.IGNORECASE)
 RE_DLL_PATH = re.compile(r"([A-Za-z]:[\\/][^\s\"']+\.(?:dll|pyd))", re.IGNORECASE)
 RE_WARN_MISSING = re.compile(r"missing module named\s+([\w\.]+)", re.IGNORECASE)
 
-# Noise lines that never carry actionable information: routine Windows
-# system-DLL dependency bookkeeping that PyInstaller performs for every
-# single binary it inspects. These clutter the log without ever pointing
-# at something the user can act on, so they are suppressed even in the
-# default filtered view.
 RE_NOISE_DEP_PROCESSING = re.compile(r"Processing dependency, name:", re.IGNORECASE)
 RE_NOISE_DEP_SKIP = re.compile(
     r"Skipping dependency .* due to (global exclusion rules|prior processing)", re.IGNORECASE
 )
 
-# Lines that should appear in the filtered view (substring check, applied
-# before the more precise classification).
 FILTER_KEYWORDS = (
     "collecting submodules",
     "loading module hook",
@@ -273,19 +307,92 @@ def guess_dest_from_source(dll_path: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# Global catalog: accumulates every exclude-module name and add-binary
+# entry ever used across all projects, independent of per-project
+# checked state.
+# ----------------------------------------------------------------------
+
+
+class GlobalCatalog:
+    def __init__(self):
+        self.path = self._catalog_path()
+        self.exclude_names: list[str] = list(dict.fromkeys(DEFAULT_EXCLUDES + SUGGESTED_EXTRA_EXCLUDES))
+        self.add_binaries: dict[str, dict[str, str]] = {
+            dll_catalog_key(b["src"]): {"src": b["src"], "dest": b["dest"]} for b in DEFAULT_ADD_BINARIES
+        }
+        self.load_if_exists()
+
+    @staticmethod
+    def _catalog_path() -> str:
+        return os.path.join(get_app_dir(), CATALOG_FILENAME)
+
+    def load_if_exists(self) -> None:
+        if os.path.isfile(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                loaded_excludes = data.get("exclude_names", [])
+                for name in loaded_excludes:
+                    if name not in self.exclude_names:
+                        self.exclude_names.append(name)
+                loaded_binaries = data.get("add_binaries", {})
+                for key, entry in loaded_binaries.items():
+                    self.add_binaries[key] = {"src": entry["src"], "dest": entry["dest"]}
+            except (json.JSONDecodeError, OSError, KeyError) as exc:
+                messagebox.showwarning(
+                    "Could Not Load Global Catalog",
+                    f"The file\n{self.path}\ncould not be read:\n{exc}\n\n"
+                    "Falling back to built-in defaults only.",
+                )
+
+    def save(self) -> bool:
+        """Returns True on success. On failure, shows a visible error
+        dialog and returns False, so callers can react if needed."""
+        data = {
+            "exclude_names": self.exclude_names,
+            "add_binaries": self.add_binaries,
+        }
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return True
+        except OSError as exc:
+            messagebox.showerror(
+                "Could Not Save Global Catalog",
+                f"Failed to write the global catalog to:\n{self.path}\n\n"
+                f"Error: {exc}\n\n"
+                "This usually means the folder is not writable from here (e.g. the "
+                "EXE is located under a protected folder such as 'Program Files', "
+                "or security software is blocking the write). Move the EXE to a "
+                "folder you have full write access to, or run it elevated.",
+            )
+            return False
+
+    def register_exclude(self, name: str) -> None:
+        if name not in self.exclude_names:
+            self.exclude_names.append(name)
+
+    def register_add_binary(self, src: str, dest: str) -> None:
+        key = dll_catalog_key(src)
+        self.add_binaries[key] = {"src": src, "dest": dest}
+
+    def update_add_binary(self, key: str, src: str, dest: str) -> None:
+        self.add_binaries[key] = {"src": src, "dest": dest}
+
+
+# ----------------------------------------------------------------------
 # Project configuration (JSON next to the source file)
 # ----------------------------------------------------------------------
 
 
 class ProjectConfig:
-    def __init__(self, script_path: str):
+    def __init__(self, script_path: str, catalog: GlobalCatalog):
         self.script_path = script_path
         self.json_path = self._json_path_for(script_path)
+        self.catalog = catalog
         self.switches: dict[str, bool] = {name: default for name, _, default in PYINSTALLER_SWITCHES}
-        self.excludes: dict[str, bool] = {name: True for name in DEFAULT_EXCLUDES}
-        # Extra excludes added by the user during a run also live here.
-        self.add_binaries: list[AddBinaryEntry] = [dict(b) for b in DEFAULT_ADD_BINARIES]  # type: ignore[misc]
-        # Optional explicit output folder (--distpath). Empty = PyInstaller default (./dist).
+        self.checked_excludes: set[str] = set(DEFAULT_EXCLUDES)
+        self.checked_binary_keys: set[str] = set()
         self.distpath: str = ""
         self.loaded_from_disk = False
         self.load_if_exists()
@@ -301,36 +408,68 @@ class ProjectConfig:
                 with open(self.json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.switches.update(data.get("switches", {}))
-                self.excludes = data.get("excludes", self.excludes)
-                self.add_binaries = data.get("add_binaries", self.add_binaries)
                 self.distpath = data.get("distpath", self.distpath)
+
+                if "checked_excludes" in data or "checked_binary_keys" in data:
+                    self.checked_excludes = set(data.get("checked_excludes", []))
+                    self.checked_binary_keys = set(data.get("checked_binary_keys", []))
+                else:
+                    old_excludes = data.get("excludes", {})
+                    self.checked_excludes = {name for name, on in old_excludes.items() if on}
+                    old_binaries = data.get("add_binaries", [])
+                    self.checked_binary_keys = set()
+                    for b in old_binaries:
+                        if b.get("enabled", False):
+                            key = dll_catalog_key(b["src"])
+                            self.catalog.register_add_binary(b["src"], b["dest"])
+                            self.checked_binary_keys.add(key)
+                    for name in old_excludes.keys():
+                        self.catalog.register_exclude(name)
+
+                for name in self.checked_excludes:
+                    self.catalog.register_exclude(name)
+
                 self.loaded_from_disk = True
             except (json.JSONDecodeError, OSError) as exc:
                 messagebox.showwarning(
-                    "Could not load configuration",
+                    "Could Not Load Configuration",
                     f"The file\n{self.json_path}\ncould not be read:\n{exc}\n\n"
                     "Default values will be used.",
                 )
 
-    def save(self) -> None:
+    def save(self) -> bool:
         data = {
             "script_path": self.script_path,
             "switches": self.switches,
-            "excludes": self.excludes,
-            "add_binaries": self.add_binaries,
+            "checked_excludes": sorted(self.checked_excludes),
+            "checked_binary_keys": sorted(self.checked_binary_keys),
             "distpath": self.distpath,
         }
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(self.json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return True
+        except OSError as exc:
+            messagebox.showerror(
+                "Could Not Save Project Configuration",
+                f"Failed to write the project configuration to:\n{self.json_path}\n\n"
+                f"Error: {exc}",
+            )
+            return False
 
     def active_switches(self) -> list[str]:
         return [name for name, on in self.switches.items() if on]
 
     def active_excludes(self) -> list[str]:
-        return [name for name, on in self.excludes.items() if on]
+        return sorted(self.checked_excludes)
 
     def active_add_binaries(self) -> list[AddBinaryEntry]:
-        return [b for b in self.add_binaries if b.get("enabled", True)]
+        result: list[AddBinaryEntry] = []
+        for key in self.checked_binary_keys:
+            entry = self.catalog.add_binaries.get(key)
+            if entry:
+                result.append({"src": entry["src"], "dest": entry["dest"], "enabled": True})
+        return result
 
     def build_command(self) -> list[str]:
         cmd: list[str] = ["pyinstaller", "--log-level=DEBUG"]
@@ -367,12 +506,9 @@ class ProjectConfig:
         return os.path.join(self.script_dir(), "build", self.script_stem(), f"warn-{self.script_stem()}.txt")
 
     def is_onefile(self) -> bool:
-        # --onefile takes precedence if both were (incorrectly) enabled.
         return self.switches.get("--onefile", False) or not self.switches.get("--onedir", False)
 
     def expected_exe_path(self) -> str:
-        """Determines the path PyInstaller is expected to use for the
-        resulting EXE, taking a possibly set --distpath into account."""
         stem = self.script_stem()
         dist_dir = self.resolved_distpath()
         if self.is_onefile():
@@ -453,6 +589,7 @@ class PyInstallerBuilderApp(tk.Tk):
         self.title("PyInstaller Build Assistant")
         self.geometry("980x800")
 
+        self.catalog = GlobalCatalog()
         self.config_obj: Optional[ProjectConfig] = None
         self.runner: Optional[BuildRunner] = None
         self.log_queue: "queue.Queue" = queue.Queue()
@@ -460,12 +597,12 @@ class PyInstallerBuilderApp(tk.Tk):
 
         self.switch_vars: dict[str, tk.BooleanVar] = {}
         self.exclude_vars: dict[str, tk.BooleanVar] = {}
-        self.add_binary_rows: list[dict] = []  # {"enabled_var", "src", "dest", "frame"}
+        self.binary_rows: dict[str, dict] = {}
 
         self._build_ui()
+        self._populate_from_catalog()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self._poll_log_queue)
-
-    # ---------------- Helper: guarantee a config object exists ----------------
 
     def _require_config(self) -> ProjectConfig:
         """Ensures a project configuration exists before it is accessed.
@@ -474,17 +611,13 @@ class PyInstallerBuilderApp(tk.Tk):
             source = self.source_var.get().strip()
             if not source:
                 raise ValueError("No source script has been selected yet.")
-            self.config_obj = ProjectConfig(source)
+            self.config_obj = ProjectConfig(source, self.catalog)
             self._apply_config_to_ui()
         return self.config_obj
 
-    # ---------------- Reusable scrollable grid container ----------------
-
     def _make_scrollable_grid(self, parent) -> ttk.Frame:
         """Creates a vertically scrollable area (canvas + inner frame) and
-        returns the inner frame that content should be gridded into. Used
-        for the exclude-module and add-binary lists so they never run out
-        of space even with many entries."""
+        returns the inner frame that content should be gridded into."""
         container = ttk.Frame(parent)
         container.pack(fill="both", expand=True, padx=5, pady=5)
 
@@ -508,10 +641,7 @@ class PyInstallerBuilderApp(tk.Tk):
 
         return inner
 
-    # ---------------- UI construction ----------------
-
     def _build_ui(self):
-        # --- Step 1: source ---
         frame_source = ttk.LabelFrame(self, text="1. Project Source")
         frame_source.pack(fill="x", padx=10, pady=(10, 5))
 
@@ -523,7 +653,6 @@ class PyInstallerBuilderApp(tk.Tk):
             side="left", padx=5, pady=5
         )
 
-        # --- Notebook with steps 2-5 ---
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -542,7 +671,6 @@ class PyInstallerBuilderApp(tk.Tk):
         self._build_binaries_tab()
         self._build_log_tab()
 
-        # --- Result row (success / EXE path) ---
         self.result_frame = ttk.Frame(self)
         self.result_frame.pack(fill="x", padx=10, pady=(0, 5))
         self.result_var = tk.StringVar(value="")
@@ -551,10 +679,8 @@ class PyInstallerBuilderApp(tk.Tk):
         self.btn_open_folder = ttk.Button(
             self.result_frame, text="Open Output Folder", command=self.on_open_dist_folder
         )
-        # only shown after a successful build
         self.btn_open_folder.pack_forget()
 
-        # --- Bottom action bar ---
         action_frame = ttk.Frame(self)
         action_frame.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -568,6 +694,10 @@ class PyInstallerBuilderApp(tk.Tk):
 
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(action_frame, textvariable=self.status_var).pack(side="left", padx=15)
+
+        # Ensure the main window (and thus its widgets, e.g. the exclude
+        # entry field) reliably has keyboard focus right from the start.
+        self.after(50, lambda: (self.focus_force(), self.lift()))
 
     def _build_switches_tab(self):
         for name, label, default in PYINSTALLER_SWITCHES:
@@ -606,32 +736,32 @@ class PyInstallerBuilderApp(tk.Tk):
         top.pack(fill="x", padx=5, pady=5)
         ttk.Label(
             top,
-            text="Pre-populated with known trouble makers (large packages, or ones often only imported transitively).",
+            text=(
+                "Shows every exclude-module name ever used across all projects (global catalog), "
+                "unchecked by default. Checking one here only affects the currently loaded project."
+            ),
         ).pack(anchor="w")
 
         self.excludes_list_frame = self._make_scrollable_grid(self.tab_excludes)
         self._exclude_grid_count = 0
 
-        for name in DEFAULT_EXCLUDES:
-            self._add_exclude_row(name, checked=True)
-
-        sep = ttk.Separator(self.tab_excludes, orient="horizontal")
-        sep.pack(fill="x", padx=5, pady=5)
-        ttk.Label(self.tab_excludes, text="Further suggestions (not enabled by default):").pack(
-            anchor="w", padx=5
-        )
-        for name in SUGGESTED_EXTRA_EXCLUDES:
-            self._add_exclude_row(name, checked=False)
-
         add_frame = ttk.Frame(self.tab_excludes)
         add_frame.pack(fill="x", padx=5, pady=8)
         self.new_exclude_var = tk.StringVar()
-        ttk.Entry(add_frame, textvariable=self.new_exclude_var, width=40).pack(side="left", padx=5)
+        exclude_entry = ttk.Entry(add_frame, textvariable=self.new_exclude_var, width=40)
+        exclude_entry.pack(side="left", padx=5)
         ttk.Button(add_frame, text="Add Module", command=self.on_add_exclude_manual).pack(
             side="left", padx=5
         )
+        # Enter key as a convenient shortcut, and an explicit click-to-focus
+        # binding as a defensive measure against any stray focus grabs.
+        exclude_entry.bind("<Return>", lambda e: self.on_add_exclude_manual())
+        exclude_entry.bind("<Button-1>", lambda e: exclude_entry.focus_set())
 
     def _add_exclude_row(self, name: str, checked: bool):
+        if name in self.exclude_vars:
+            self.exclude_vars[name].set(checked)
+            return
         var = tk.BooleanVar(value=checked)
         self.exclude_vars[name] = var
         row, col = divmod(self._exclude_grid_count, GRID_COLUMNS)
@@ -645,21 +775,18 @@ class PyInstallerBuilderApp(tk.Tk):
         ttk.Label(
             top,
             text=(
-                "Suggestion list of known DLL cases - disabled by default.\n"
-                "Please enable exactly what the current project needs (paths can vary by machine, "
-                "e.g. NumPy DLLs with a build hash in the filename). Source paths of enabled entries "
-                "are validated before the build starts.\n"
+                "Shows every add-binary entry ever used across all projects (global catalog), keyed by "
+                "DLL filename, unchecked by default. Checking one here only affects the currently loaded "
+                "project. Double-click an entry to edit its source path / target folder in place (e.g. "
+                "after moving to a different machine).\n"
                 "Note: the target folder is not just a label - it must match the folder the owning "
-                "package expects the DLL in at runtime (see the Add Binary dialog for details)."
+                "package expects the DLL in at runtime."
             ),
             justify="left",
         ).pack(anchor="w")
 
         self.binaries_list_frame = self._make_scrollable_grid(self.tab_binaries)
         self._binary_grid_count = 0
-
-        for entry in DEFAULT_ADD_BINARIES:
-            self._add_binary_row(entry["src"], entry["dest"], enabled=entry["enabled"])
 
         add_frame = ttk.LabelFrame(self.tab_binaries, text="Add New DLL")
         add_frame.pack(fill="x", padx=5, pady=8)
@@ -679,24 +806,37 @@ class PyInstallerBuilderApp(tk.Tk):
         ttk.Entry(row2, textvariable=self.new_binary_dest_var, width=40).pack(side="left", padx=5)
         ttk.Button(row2, text="Add DLL", command=self.on_add_binary_manual).pack(side="left", padx=5)
 
-    def _add_binary_row(self, src: str, dest: str, enabled: bool):
-        enabled_var = tk.BooleanVar(value=enabled)
-        label_text = f"{src}   ->   {dest}"
+    def _add_or_update_binary_row(self, key: str, src: str, dest: str, checked: bool):
+        if key in self.binary_rows:
+            row = self.binary_rows[key]
+            row["src"] = src
+            row["dest"] = dest
+            row["label_var"].set(f"{src}\n->  {dest}")
+            row["enabled_var"].set(checked)
+            return
 
-        row, col = divmod(self._binary_grid_count, GRID_COLUMNS)
+        enabled_var = tk.BooleanVar(value=checked)
+        label_var = tk.StringVar(value=f"{src}\n->  {dest}")
+
+        row_idx, col = divmod(self._binary_grid_count, GRID_COLUMNS)
         cell = ttk.Frame(self.binaries_list_frame)
-        cell.grid(row=row, column=col, sticky="w", padx=10, pady=2)
+        cell.grid(row=row_idx, column=col, sticky="w", padx=10, pady=2)
 
         cb = ttk.Checkbutton(cell, variable=enabled_var)
-        cb.pack(side="left")
-        lbl = ttk.Label(cell, text=label_text, wraplength=280, justify="left")
+        cb.pack(side="left", anchor="n")
+        lbl = ttk.Label(cell, textvariable=label_var, wraplength=280, justify="left", cursor="hand2")
         lbl.pack(side="left", padx=5)
+        lbl.bind("<Double-Button-1>", lambda e, k=key: self.on_edit_binary_entry(k))
 
         self._binary_grid_count += 1
 
-        self.add_binary_rows.append(
-            {"enabled_var": enabled_var, "src": src, "dest": dest, "frame": cell}
-        )
+        self.binary_rows[key] = {
+            "enabled_var": enabled_var,
+            "label_var": label_var,
+            "src": src,
+            "dest": dest,
+            "cell": cell,
+        }
 
     def _build_log_tab(self):
         top = ttk.Frame(self.tab_log)
@@ -740,13 +880,24 @@ class PyInstallerBuilderApp(tk.Tk):
 
         self.log_text.bind("<Enter>", lambda e: self.log_text.bind_all("<MouseWheel>", _on_log_mousewheel))
         self.log_text.bind("<Leave>", lambda e: self.log_text.unbind_all("<MouseWheel>"))
-        # Shift+MouseWheel for horizontal scrolling, standard convention on Windows.
         self.log_text.bind(
             "<Shift-MouseWheel>",
             lambda e: self.log_text.xview_scroll(-1 * int(e.delta / 120) if e.delta else 0, "units"),
         )
 
-    # ---------------- Event handlers ----------------
+    def _populate_from_catalog(self):
+        for name in self.catalog.exclude_names:
+            self._add_exclude_row(name, checked=False)
+        for key, entry in self.catalog.add_binaries.items():
+            self._add_or_update_binary_row(key, entry["src"], entry["dest"], checked=False)
+
+    def _refresh_catalog_widgets(self):
+        for name in self.catalog.exclude_names:
+            if name not in self.exclude_vars:
+                self._add_exclude_row(name, checked=False)
+        for key, entry in self.catalog.add_binaries.items():
+            if key not in self.binary_rows:
+                self._add_or_update_binary_row(key, entry["src"], entry["dest"], checked=False)
 
     def on_choose_source(self):
         path = filedialog.askopenfilename(
@@ -755,7 +906,8 @@ class PyInstallerBuilderApp(tk.Tk):
         if not path:
             return
         self.source_var.set(path)
-        self.config_obj = ProjectConfig(path)
+        self.config_obj = ProjectConfig(path, self.catalog)
+        self._refresh_catalog_widgets()
         self._apply_config_to_ui()
         self._reset_result_display()
         msg = "loaded from " + self.config_obj.json_path if self.config_obj.loaded_from_disk else "newly created (defaults)"
@@ -770,29 +922,26 @@ class PyInstallerBuilderApp(tk.Tk):
 
         self.distpath_var.set(cfg.distpath)
 
-        # Excludes: update existing checkboxes, add new ones (from JSON)
-        for name, on in cfg.excludes.items():
+        for var in self.exclude_vars.values():
+            var.set(False)
+        for name in cfg.checked_excludes:
             if name not in self.exclude_vars:
-                self._add_exclude_row(name, checked=on)
+                self._add_exclude_row(name, checked=True)
             else:
-                self.exclude_vars[name].set(on)
+                self.exclude_vars[name].set(True)
 
-        # Add-binaries: rebuild the list entirely from the config
-        for row in self.add_binary_rows:
-            row["frame"].destroy()
-        self.add_binary_rows.clear()
-        self._binary_grid_count = 0
-        for b in cfg.add_binaries:
-            self._add_binary_row(b["src"], b["dest"], enabled=b.get("enabled", False))
+        for row in self.binary_rows.values():
+            row["enabled_var"].set(False)
+        for key in cfg.checked_binary_keys:
+            if key in self.binary_rows:
+                self.binary_rows[key]["enabled_var"].set(True)
 
     def on_add_exclude_manual(self):
         name = self.new_exclude_var.get().strip()
         if not name:
             return
-        if name in self.exclude_vars:
-            self.exclude_vars[name].set(True)
-        else:
-            self._add_exclude_row(name, checked=True)
+        self.catalog.register_exclude(name)
+        self._add_exclude_row(name, checked=True)
         self.new_exclude_var.set("")
 
     def on_choose_binary_src(self):
@@ -813,32 +962,66 @@ class PyInstallerBuilderApp(tk.Tk):
         if not src or not dest:
             messagebox.showinfo("Missing information", "Please provide both a source path and a target folder.")
             return
-        self._add_binary_row(src, dest, enabled=True)
+        key = dll_catalog_key(src)
+        self.catalog.register_add_binary(src, dest)
+        self._add_or_update_binary_row(key, src, dest, checked=True)
         self.new_binary_src_var.set("")
         self.new_binary_dest_var.set("")
 
+    def on_edit_binary_entry(self, key: str):
+        row = self.binary_rows.get(key)
+        if row is None:
+            return
+        new_src = simpledialog.askstring(
+            "Edit Source Path",
+            "Adjust the source path for this DLL (e.g. after moving to a different machine):",
+            initialvalue=row["src"],
+        )
+        if new_src is None:
+            return
+        new_dest = simpledialog.askstring(
+            "Edit Target Folder",
+            "Adjust the target folder inside the bundle:",
+            initialvalue=row["dest"],
+        )
+        if new_dest is None:
+            return
+        new_src = new_src.strip()
+        new_dest = new_dest.strip()
+        if not new_src or not new_dest:
+            return
+
+        new_key = dll_catalog_key(new_src)
+        checked = row["enabled_var"].get()
+
+        if new_key != key:
+            self.catalog.add_binaries.pop(key, None)
+            row["cell"].destroy()
+            del self.binary_rows[key]
+            self.catalog.register_add_binary(new_src, new_dest)
+            self._add_or_update_binary_row(new_key, new_src, new_dest, checked=checked)
+        else:
+            self.catalog.update_add_binary(key, new_src, new_dest)
+            self._add_or_update_binary_row(key, new_src, new_dest, checked=checked)
+
+        self.status_var.set(f"Updated catalog entry for '{os.path.basename(new_src)}'.")
+
     def on_toggle_full_log(self):
-        # Only affects future lines; reflected in the status line.
         mode = "Full" if self.full_log_var.get() else "Filtered"
         self.status_var.set(f"Log view: {mode}")
 
     def _sync_config_from_ui(self):
         cfg = self._require_config()
         cfg.switches = {name: var.get() for name, var in self.switch_vars.items()}
-        cfg.excludes = {name: var.get() for name, var in self.exclude_vars.items()}
         cfg.distpath = self.distpath_var.get().strip()
-        cfg.add_binaries = [
-            {"src": row["src"], "dest": row["dest"], "enabled": row["enabled_var"].get()}
-            for row in self.add_binary_rows
-        ]
+        cfg.checked_excludes = {name for name, var in self.exclude_vars.items() if var.get()}
+        cfg.checked_binary_keys = {key for key, row in self.binary_rows.items() if row["enabled_var"].get()}
 
     def _reset_result_display(self):
         self.result_var.set("")
         self.btn_open_folder.pack_forget()
 
     def _validate_add_binary_paths(self, cfg: ProjectConfig) -> list[str]:
-        """Checks whether all enabled add-binary source paths exist.
-        Returns a list of missing paths (empty = all good)."""
         missing = []
         for b in cfg.active_add_binaries():
             if not os.path.isfile(b["src"]):
@@ -858,7 +1041,6 @@ class PyInstallerBuilderApp(tk.Tk):
 
         cfg = self._require_config()
 
-        # Pre-check: do all enabled add-binary source paths exist?
         missing_paths = self._validate_add_binary_paths(cfg)
         if missing_paths:
             details = "\n".join(f"  - {p}" for p in missing_paths)
@@ -876,15 +1058,11 @@ class PyInstallerBuilderApp(tk.Tk):
                 return
 
         cfg.save()
+        self.catalog.save()
         cmd = cfg.build_command()
 
         self._reset_result_display()
-
-        # Clear the log view so a new build never mixes with a previous
-        # run's output.
         self.log_text.delete("1.0", "end")
-
-        # Immediately switch to the Live Log tab so the user sees the build.
         self.notebook.select(self.tab_log)
 
         self._log_line(f"$ {' '.join(cmd)}", tags=())
@@ -898,9 +1076,6 @@ class PyInstallerBuilderApp(tk.Tk):
             messagebox.showwarning("Log File", f"Could not create the full log file:\n{exc}")
             self.full_log_file = None
 
-        # PyInstaller resolves --distpath/--workpath relative to the
-        # process cwd - this is why the build ALWAYS starts in the
-        # script's folder, regardless of the terminal's working directory.
         self.runner = BuildRunner(cmd, cwd=log_dir, line_queue=self.log_queue)
         self.runner.start()
 
@@ -912,6 +1087,16 @@ class PyInstallerBuilderApp(tk.Tk):
         if self.runner:
             self.runner.kill()
             self.status_var.set("Cancellation requested (hard kill)...")
+
+    def on_close(self):
+        try:
+            if self.config_obj is not None:
+                self._sync_config_from_ui()
+                self.config_obj.save()
+            self.catalog.save()
+        except Exception:
+            pass
+        self.destroy()
 
     def on_open_dist_folder(self):
         if self.config_obj is None:
@@ -938,7 +1123,6 @@ class PyInstallerBuilderApp(tk.Tk):
         elif category in ("dll", "analyzing_binary") and value is not None:
             self._offer_add_binary(value)
         else:
-            # Fallback: just copy to clipboard
             self.clipboard_clear()
             self.clipboard_append(line_text)
             self.status_var.set("No module/DLL recognized - line copied to clipboard.")
@@ -950,18 +1134,11 @@ class PyInstallerBuilderApp(tk.Tk):
             f"Add it as an exclude-module entry and enable it?",
         )
         if answer:
-            if module_name in self.exclude_vars:
-                self.exclude_vars[module_name].set(True)
-            else:
-                self._add_exclude_row(module_name, checked=True)
+            self.catalog.register_exclude(module_name)
+            self._add_exclude_row(module_name, checked=True)
             self.status_var.set(f"'{module_name}' added to excludes. You can restart the build.")
 
     def _offer_add_binary(self, dll_path: str):
-        # Pre-fill with a guess: the immediate parent folder name in
-        # site-packages usually matches the Python package name that
-        # expects the DLL at this exact location at runtime (this is NOT
-        # just a display label - it is the actual extraction path inside
-        # the bundle; see --add-binary DEST semantics).
         suggested_dest = guess_dest_from_source(dll_path)
         dest_guess = simpledialog.askstring(
             "Add Add-Binary Entry",
@@ -975,10 +1152,10 @@ class PyInstallerBuilderApp(tk.Tk):
             initialvalue=suggested_dest,
         )
         if dest_guess:
-            self._add_binary_row(dll_path, dest_guess.strip(), enabled=True)
+            key = dll_catalog_key(dll_path)
+            self.catalog.register_add_binary(dll_path, dest_guess.strip())
+            self._add_or_update_binary_row(key, dll_path, dest_guess.strip(), checked=True)
             self.status_var.set(f"DLL '{os.path.basename(dll_path)}' added to add-binary.")
-
-    # ---------------- Log processing ----------------
 
     def _log_line(self, text: str, tags=()):
         self.log_text.insert("end", text + "\n", tags)
@@ -1007,9 +1184,6 @@ class PyInstallerBuilderApp(tk.Tk):
 
         show_full = self.full_log_var.get()
 
-        # Routine Windows system-DLL dependency bookkeeping is suppressed
-        # even in full-log mode's "relevant" pre-filter, but full mode
-        # still gets to see literally everything if explicitly requested.
         if not show_full and is_noise_line(line):
             return
 
