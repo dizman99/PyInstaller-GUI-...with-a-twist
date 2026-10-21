@@ -85,13 +85,13 @@ While a build is running, double-click any highlighted line in the log to pull t
 
 ## Screenshots
 
-![Project source and PyInstaller switches](screenshots/1.png)
+![Project source and PyInstaller switches](screenshots/1.PNG)
 
-![Exclude modules grid](screenshots/2.png)
+![Exclude modules grid](screenshots/2.PNG)
 
-![Add binary grid](screenshots/3.png)
+![Add binary grid](screenshots/3.PNG)
 
-![Live build log](screenshots/4.png)
+![Live build log](screenshots/4.PNG)
 
 ## Technical Details
 
