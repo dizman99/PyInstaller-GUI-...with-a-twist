@@ -115,7 +115,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from typing import Optional, TypedDict
-
+import time
+from collections import deque
 # ----------------------------------------------------------------------
 # Type definitions
 # ----------------------------------------------------------------------
@@ -244,6 +245,24 @@ RE_NOISE_DEP_PROCESSING = re.compile(r"Processing dependency, name:", re.IGNOREC
 RE_NOISE_DEP_SKIP = re.compile(
     r"Skipping dependency .* due to (global exclusion rules|prior processing)", re.IGNORECASE
 )
+
+RE_PYI_PREFIX = re.compile(
+    r"^\s*\d+\s+(INFO|DEBUG|WARNING|ERROR|CRITICAL|TRACE|DEPRECATION):", re.IGNORECASE)
+RE_PYI_SEVERE = re.compile(
+    r"^\s*\d+\s+(ERROR|CRITICAL|DEPRECATION):", re.IGNORECASE)
+
+# (Teilstring in der Ausgabe, Hinweis) - gern erweitern
+KNOWN_FAILURE_HINTS = [
+    ("obsolete backport",
+     "Ein veraltetes Backport-Paket (z. B. 'typing') ist installiert und mit PyInstaller "
+     "unvertraeglich. Abhilfe: 'pip uninstall typing' (bzw. das in der Meldung genannte Paket)."),
+    ("No module named",
+     "Ein Modul fehlt in der Python-Umgebung, mit der PyInstaller laeuft."),
+    ("PermissionError",
+     "Zugriff verweigert: Ziel-EXE evtl. noch gestartet oder vom Virenscanner gesperrt."),
+]
+
+
 
 FILTER_KEYWORDS = (
     "collecting submodules",
@@ -599,6 +618,11 @@ class PyInstallerBuilderApp(tk.Tk):
         self.exclude_vars: dict[str, tk.BooleanVar] = {}
         self.binary_rows: dict[str, dict] = {}
 
+        self.recent_lines = deque(maxlen=40)
+        self.build_started = 0.0
+        self.saw_severe = False
+        self.full_log_path = ""
+
         self._build_ui()
         self._populate_from_catalog()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -873,6 +897,7 @@ class PyInstallerBuilderApp(tk.Tk):
         self.log_text.tag_configure("error_hit", foreground="#ff6b6b")
         self.log_text.tag_configure("success_hit", foreground="#69db7c")
         self.log_text.bind("<Double-Button-1>", self.on_log_double_click)
+        self.log_text.tag_configure("msg_hit", foreground="#ffd166")
 
         def _on_log_mousewheel(event):
             delta = -1 * int(event.delta / 120) if event.delta else 0
@@ -1063,6 +1088,9 @@ class PyInstallerBuilderApp(tk.Tk):
 
         self._reset_result_display()
         self.log_text.delete("1.0", "end")
+        self.recent_lines.clear()
+        self.build_started = time.time()
+        self.saw_severe = False
         self.notebook.select(self.tab_log)
 
         self._log_line(f"$ {' '.join(cmd)}", tags=())
@@ -1070,6 +1098,8 @@ class PyInstallerBuilderApp(tk.Tk):
 
         log_dir = cfg.script_dir()
         full_log_path = os.path.join(log_dir, f"{cfg.script_stem()}.build.full.log")
+        self.full_log_path = full_log_path
+
         try:
             self.full_log_file = open(full_log_path, "w", encoding="utf-8")
         except OSError as exc:
@@ -1182,14 +1212,19 @@ class PyInstallerBuilderApp(tk.Tk):
             except Exception:
                 pass
 
-        show_full = self.full_log_var.get()
+        self.recent_lines.append(line)
 
+        show_full = self.full_log_var.get()
         if not show_full and is_noise_line(line):
             return
 
-        category, _value = classify_line(line)
+        category, value = classify_line(line)
+        severe = bool(RE_PYI_SEVERE.search(line))
+        unprefixed = bool(line.strip()) and not RE_PYI_PREFIX.search(line)
+        if severe:
+            self.saw_severe = True
 
-        if show_full or line_is_relevant(line) or category:
+        if show_full or line_is_relevant(line) or category or severe or unprefixed:
             tags = ()
             if category == "analyzing_binary":
                 tags = ("analyzing_hit",)
@@ -1197,9 +1232,36 @@ class PyInstallerBuilderApp(tk.Tk):
                 tags = ("module_hit",)
             elif category == "dll":
                 tags = ("dll_hit",)
-            elif "error" in line.lower() or "traceback" in line.lower():
+            elif severe or "error" in line.lower() or "traceback" in line.lower():
                 tags = ("error_hit",)
+            elif unprefixed:
+                tags = ("msg_hit",)
             self._log_line(line, tags=tags)
+
+    def dump_failure_context(self, returncode: int):
+        elapsed = time.time() - self.build_started
+        self._log_line(f"--- Build endete mit Code {returncode} nach {elapsed:.1f} s. "
+                      f"Letzte Ausgabezeilen: ---", tags=("error_hit",))
+        lines = list(self.recent_lines)[-15:]
+        if not lines:
+            self._log_line("(PyInstaller hat gar nichts ausgegeben - evtl. wurde der Prozess "
+                          "sofort beendet, z. B. durch Virenscanner oder falsche Umgebung)",
+                          tags=("error_hit",))
+        for l in lines:
+            self._log_line(l, tags=("msg_hit",))
+
+        joined = "\n".join(self.recent_lines)
+        for needle, hint in KNOWN_FAILURE_HINTS:
+            if needle.lower() in joined.lower():
+                self._log_line(f"HINWEIS: {hint}", tags=("error_hit",))
+
+        if elapsed < 10 and not self.saw_severe:
+            self._log_line("HINWEIS: Sehr kurzer Build ohne ERROR-Zeile - PyInstaller ist "
+                          "vermutlich schon beim Start/Pre-Check ausgestiegen (Grund siehe "
+                          "Zeilen oben).", tags=("error_hit",))
+        if self.full_log_path:
+            self._log_line(f"Vollstaendiges Log: {self.full_log_path}", tags=("error_hit",))
+
 
     def _handle_build_done(self, return_code: int):
         self.btn_build.configure(state="normal")
@@ -1221,6 +1283,8 @@ class PyInstallerBuilderApp(tk.Tk):
         else:
             self.status_var.set(f"Build ended with code {return_code} (possibly cancelled).")
             self._log_line(f"=== BUILD ENDED (code {return_code}) ===", tags=("error_hit",))
+            self.dump_failure_context(return_code)
+            self._check_warn_file()
 
         self._check_warn_file()
 
